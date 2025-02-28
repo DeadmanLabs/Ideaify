@@ -20,6 +20,11 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.output_parsers import ResponseSchema, StructuredOutputParser  
+from langchain.chains import LLMChain
+
 
 # Load environment variables from .env
 load_dotenv()
@@ -29,11 +34,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("idea_summarizer.log"),
+        logging.FileHandler(f"{datetime.now()} - summarizer.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("idea_summarizer")
+logger = logging.getLogger(f"{datetime.now()} - summarizer")
 
 # ==================== DATA MODELS ====================
 
@@ -255,10 +260,6 @@ def create_content_source(source_type: str, **kwargs) -> ContentSource:
 class LangchainProcessor:
     def __init__(self, config: Dict[str, Any]):
         try:
-            from langchain.chat_models import ChatOpenAI
-            from langchain.prompts import ChatPromptTemplate
-            from langchain.output_parsers import ResponseSchema, StructuredOutputParser
-            from langchain.chains import LLMChain
             self.llm = ChatOpenAI(
                 model_name=config.get("openai_model", os.environ.get("OPENAI_MODEL", "gpt-4")),
                 temperature=float(config.get("temperature", os.environ.get("TEMPERATURE", 0.7))),
@@ -282,7 +283,7 @@ class LangchainProcessor:
             )
             self.tags_schema = ResponseSchema(
                 name="tags",
-                description="5-10 relevant tags for the idea, comma-separated"
+                description="5-10 relevant tags for the idea as a JSON array of strings."
             )
             self.tech_stack_schema = ResponseSchema(
                 name="tech_stack",
@@ -314,16 +315,38 @@ class LangchainProcessor:
             self.format_instructions = self.parser.get_format_instructions()
             self.prompt_template = ChatPromptTemplate.from_template(
                 """You are an expert business and technology consultant tasked with analyzing ideas and turning them into structured proposals.
-                
-Please analyze the following business or software idea and provide a comprehensive breakdown.
+
+Please analyze the following business or software idea and provide a comprehensive breakdown, strictly following the JSON schema provided below.
+
+JSON Schema:
+{
+  "title": "string, concise title (max 60 chars)",
+  "summary": "string, comprehensive summary (200-300 words)",
+  "key_points": ["string", ...],  // Array of 5-7 key points
+  "category": "string, one word category (e.g., software, business)",
+  "tags": ["string", ...],         // JSON array of 5-10 tags
+  "tech_stack": {
+      "frontend": ["string"],
+      "backend": ["string"],
+      "database": ["string"],
+      "infrastructure": ["string"],
+      "tools": ["string"]
+  },
+  "design_philosophy": {
+      "principles": ["string"],
+      "architecture": ["string"],
+      "methodology": ["string"]
+  },
+  "market_analysis": "string, brief market analysis",
+  "risks": ["string", ...]         // Array of potential risks
+}
+
+Ensure that your response is valid JSON and follows the schema exactly. Do not include any extraneous text outside of the JSON.
 
 IDEA:
 {idea_text}
 
 {format_instructions}
-
-Be creative but practical in your analysis. Focus on feasibility and innovation.
-For the tech stack and design philosophy, make specific recommendations based on the idea.
 """
             )
             self.chain = LLMChain(llm=self.llm, prompt=self.prompt_template)
@@ -420,22 +443,22 @@ For the tech stack and design philosophy, make specific recommendations based on
             "title": title,
             "summary": summary[:500],
             "key_points": key_points[:7],
-            "category": "software",
-            "tags": ["idea", "concept", "software"],
+            "category": "unknown",
+            "tags": [],
             "tech_stack": {
-                "frontend": ["React", "TypeScript"],
-                "backend": ["Node.js", "Express"],
-                "database": ["PostgreSQL"],
-                "infrastructure": ["Docker", "AWS"],
-                "tools": ["Git", "GitHub Actions"]
+                "frontend": [],
+                "backend": [],
+                "database": [],
+                "infrastructure": [],
+                "tools": []
             },
             "design_philosophy": {
-                "principles": ["User-centered design", "Modularity"],
-                "architecture": ["Microservices", "API-first"],
-                "methodology": ["Agile", "CI/CD"]
+                "principles": [],
+                "architecture": [],
+                "methodology": []
             },
-            "market_analysis": "This appears to be a potential software project.",
-            "risks": ["Technical feasibility", "Market adoption", "Resource constraints"]
+            "market_analysis": "",
+            "risks": []
         }
 
 # ==================== STORAGE SYSTEMS ====================

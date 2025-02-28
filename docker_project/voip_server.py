@@ -1,104 +1,152 @@
 #!/usr/bin/env python3
-"""
-VOIP Server using pjsua2 for Idea Summarization
-------------------------------------------------
-This script utilizes pjsua2 (Python bindings for pjsip) to handle VOIP events.
-It processes incoming calls and instant messages:
-  - For calls: when a call ends, it will record the call audio (assumed to be saved as a file)
-    and then transcribe and summarize the audio using the Idea Summarizer.
-  - For instant messages: it processes the text directly.
-Note: Proper SIP account credentials and network configuration must be provided in the environment.
-"""
+import sys
+sys.path.insert(0, '/opt/pjproject/pjsip-apps/src/python')
+sys.path.insert(0, '/usr/local/lib/python3.8/dist-packages')
+print("Current sys.path:", sys.path)
 
 import os
-import time
-import threading
-from idea_summarizer import load_config, IdeaSummarizer
-import pjsua2
+import subprocess
+from time import sleep
 from dotenv import load_dotenv
+from pjsua2 import *
+
 load_dotenv()
 
-# Load the Idea Summarizer configuration
-config = load_config()
-summarizer = IdeaSummarizer(config)
+"""
+VOIP Server Implementation using pjsua2 with .env configuration.
+Handles both incoming text messages and voice calls.
+- Incoming texts are directly forwarded to idea_summarizer.py.
+- For voice calls:
+    • A greeting message is played.
+    • The call is recorded until it ends.
+    • The recorded audio is converted to a 16kHz WAV file.
+    • whisper.cpp (assumed to be available as an executable) transcribes the audio.
+    • The transcription text is forwarded to idea_summarizer.py.
+"""
 
-# Custom call class to handle call events
-class MyCall(pjsua2.Call):
-    def onCallState(self, prm):
-        ci = self.getInfo()
-        print("Call with", ci.remoteUri, "is", ci.stateText)
-        # When call is disconnected, assume the call audio has been recorded to 'recorded_audio.wav'
-        if ci.state == pjsua2.PJSIP_INV_STATE_DISCONNECTED:
-            print("Call disconnected. Processing recorded audio...")
-            # In a real implementation, audio recording handling is required.
-            recorded_audio = "recorded_audio.wav"
-            if os.path.exists(recorded_audio):
-                try:
-                    idea = summarizer.process_input("audio_file", file_path=recorded_audio)
-                    if idea:
-                        print("Call Summary:")
-                        print("Title:", idea.title)
-                        print("Summary:", idea.summary)
-                except Exception as e:
-                    print("Error processing call audio:", e)
-            else:
-                print("No recorded audio found.")
-
-    def onCallMediaState(self, prm):
-        # In a full implementation, set up media and recording here.
-        print("Call media state changed.")
-
-# Custom account class to handle registration and instant messages
-class MyAccount(pjsua2.Account):
-    def onRegState(self, prm):
-        print("Registration status:", prm.code, prm.reason)
+# Define the Account callback to handle incoming calls and messages
+class MyAccount(Account):
+    def onIncomingCall(self, prm):
+        call = MyCall(self, prm.callId)
+        call_prm = CallOpParam()
+        call_prm.statusCode = 200
+        call.answer(call_prm)
+        print("Incoming call answered.")
 
     def onInstantMessage(self, prm):
-        print("Received IM from", prm.fromUri, ":", prm.msgBody)
-        try:
-            idea = summarizer.process_input("direct_text", text=prm.msgBody)
-            if idea:
-                print("IM Summary:")
-                print("Title:", idea.title)
-                print("Summary:", idea.summary)
-        except Exception as e:
-            print("Error processing IM text:", e)
+        # Handle incoming text messages
+        text = prm.content
+        print("Received text message:", text)
+        forward_text_to_idea_summarizer(text)
+
+# Define the Call callback to manage call media and state
+class MyCall(Call):
+    def __init__(self, acc, call_id=PJSUA_INVALID_ID):
+        super().__init__(acc, call_id)
+        self.recorder = None
+        self.record_file = "recording.wav"
+        self.rec_16k_file = "recording_16khz.wav"
+
+    def onCallState(self, prm):
+        ci = self.getInfo()
+        print(f"Call with id {ci.id} is now in state: {ci.stateText}")
+        # When call is disconnected, process the recorded audio if any
+        if ci.state == pjsip_inv_state.PJSIP_INV_STATE_DISCONNECTED:
+            if self.recorder:
+                sleep(1)
+                print("Call ended. Processing recording...")
+                try:
+                    cmd_convert = ["ffmpeg", "-i", self.record_file, "-ar", "16000", self.rec_16k_file]
+                    subprocess.run(cmd_convert, check=True)
+                    print("Audio converted to 16kHz WAV.")
+                except Exception as e:
+                    print("Error converting audio:", e)
+                    return
+                try:
+                    cmd_whisper = ["whisper.exe", self.rec_16k_file]
+                    result = subprocess.run(cmd_whisper, capture_output=True, text=True, check=True)
+                    transcription = result.stdout.strip()
+                    print("Transcription result:", transcription)
+                except Exception as e:
+                    print("Error during transcription:", e)
+                    transcription = ""
+                if transcription:
+                    forward_text_to_idea_summarizer(transcription)
+
+    def onCallMediaState(self, prm):
+        ci = self.getInfo()
+        for mi in ci.media:
+            if mi.type == pjmedia_type.PJMEDIA_TYPE_AUDIO:
+                audio_med = AudioMedia()
+                try:
+                    self.getAudioMedia(mi.index, audio_med)
+                except Exception as e:
+                    print("Error getting audio media:", e)
+                    continue
+
+                greeting_file = os.getenv("GREETING_WAV", "greeting.wav")
+                if os.path.exists(greeting_file):
+                    try:
+                        player = AudioMediaPlayer()
+                        player.createPlayer(greeting_file)
+                        player.startTransmit(audio_med)
+                        print("Playing greeting message.")
+                    except Exception as e:
+                        print("Error playing greeting:", e)
+                else:
+                    print("Greeting file not found. Skipping greeting playback.")
+                
+                try:
+                    recorder = AudioMediaRecorder()
+                    recorder.createRecorder(self.record_file)
+                    audio_med.startTransmit(recorder)
+                    self.recorder = recorder
+                    print("Started recording the call.")
+                except Exception as e:
+                    print("Error starting recorder:", e)
+
+def forward_text_to_idea_summarizer(text):
+    """
+    Forwards the given text to idea_summarizer.py.
+    The idea_summarizer.py script is expected to read the text argument and process it.
+    """
+    cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "idea_summarizer.py"), text]
+    subprocess.run(cmd, check=True)
+    print("Text forwarded to idea_summarizer.py.")
 
 def main():
-    # Create and initialize the endpoint
-    ep = pjsua2.Endpoint()
+    ep = Endpoint()
     ep.libCreate()
-    ep_cfg = pjsua2.EpConfig()
+    ep_cfg = EpConfig()
     ep.libInit(ep_cfg)
-    
-    # Create a UDP transport on port 5060
-    tcfg = pjsua2.TransportConfig()
-    tcfg.port = 5060
-    ep.transportCreate(pjsua2.PJSIP_TRANSPORT_UDP, tcfg)
+
+    trans_cfg = TransportConfig()
+    trans_cfg.port = int(os.getenv("SIP_PORT", "5060"))
+    ep.transportCreate(PJSIP_TRANSPORT_UDP, trans_cfg)
     ep.libStart()
-    print("pjsua2 endpoint started.")
+    print("pjsua2 library started.")
 
-    # Set up SIP account configuration; these values should be set in the environment
-    acc_cfg = pjsua2.AccountConfig()
-    acc_cfg.idUri = os.environ.get("SIP_ID_URI", "sip:username@sip_provider")
-    acc_cfg.regConfig.registrarUri = os.environ.get("SIP_REGISTRAR", "sip:sip_provider")
-    # Set SIP authentication credentials
-    auth_cred = pjsua2.AuthCredInfo("digest", "*", os.environ.get("SIP_USERNAME", "username"), 0, os.environ.get("SIP_PASSWORD", "password"))
+    acc_cfg = AccountConfig()
+    acc_cfg.idUri = os.getenv("SIP_ID")
+    acc_cfg.regConfig.registrarUri = os.getenv("SIP_REGISTRAR")
+    user = os.getenv("SIP_USER")
+    password = os.getenv("SIP_PASS")
+    auth_cred = AuthCredInfo("digest", "*", user, 0, password)
     acc_cfg.sipConfig.authCreds.append(auth_cred)
-    
-    # Create account and register
-    acc = MyAccount()
-    acc.create(acc_cfg)
-    print("SIP account created and registration initiated.")
 
-    # Main event loop
+    my_acc = MyAccount()
+    my_acc.create(acc_cfg)
+    print("SIP account created and registered.")
+
+    print("VOIP server is running. Press Ctrl+C to exit.")
     try:
         while True:
-            time.sleep(1)
+            sleep(1)
     except KeyboardInterrupt:
-        print("Exiting VOIP server...")
+        print("Shutting down VOIP server...")
+    finally:
+        ep.libDestroy()
+        print("pjsua2 library destroyed.")
 
-    ep.libDestroy()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

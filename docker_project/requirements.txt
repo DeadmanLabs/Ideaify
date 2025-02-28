@@ -1,1 +1,11 @@
-Flask==2.0.1
+Flask
+python-dotenv
+langchain
+langchain_core
+langchain_community
+langgraph
+openai
+numpy
+pandas
+matplotlib
+langchain_openai
