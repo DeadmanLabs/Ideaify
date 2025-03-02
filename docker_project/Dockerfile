@@ -29,6 +29,7 @@ RUN apt-get install -y cmake
 RUN apt-get install -y python3-dev
 RUN apt-get install -y python3-pip
 RUN apt-get install -y python3 swig g++
+RUN apt-get install -y kmod
 RUN rm -rf /var/apt/list/*
 
 WORKDIR /opt
@@ -56,6 +57,9 @@ RUN echo 'find_library(DL_LIBRARY dl REQUIRED)' >> CMakeLists.txt && \
     sed -i '/^add_subdirectory(examples)/i link_libraries(${DL_LIBRARY})' CMakeLists.txt
 
 RUN make
+
+RUN modprobe snd-dummy
+RUN aplay -l
 
 WORKDIR /app
 EXPOSE 8000
