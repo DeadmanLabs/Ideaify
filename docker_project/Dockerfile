@@ -29,13 +29,13 @@ RUN apt-get install -y cmake
 RUN apt-get install -y python3-dev
 RUN apt-get install -y python3-pip
 RUN apt-get install -y python3 swig g++
-RUN apt-get install -y kmod
+RUN apt-get install -y kmod libasound2-plugins
 RUN rm -rf /var/apt/list/*
 
 WORKDIR /opt
 RUN git clone https://github.com/pjsip/pjproject.git
 WORKDIR /opt/pjproject
-RUN ./configure --disable-video --enable-shared
+RUN ./configure --enable-shared --disable-video --enable-threads CXXFLAGS='-DPJSUA_HAS_PYTHON=1 -DPJ_AUTOCONF=1' CPPFLAGS='-DPJSUA_HAS_PYTHON=1 -DPJ_AUTOCONF=1'
 RUN make dep && make
 RUN make install
 WORKDIR /opt/pjproject/pjsip-apps/src/swig
@@ -58,12 +58,12 @@ RUN echo 'find_library(DL_LIBRARY dl REQUIRED)' >> CMakeLists.txt && \
 
 RUN make
 
-RUN modprobe snd-dummy
-RUN aplay -l
-
 WORKDIR /app
 EXPOSE 8000
-VOLUME ["/data"]
+VOLUME ["/data", "/obsidian/vault"]
+
+# Create the Obsidian vault directory
+RUN mkdir -p /obsidian/vault/Ideas
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

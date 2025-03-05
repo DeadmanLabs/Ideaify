@@ -1,5 +1,6 @@
 from flask import Flask, request
 import os
+import uuid
 
 app = Flask(__name__)
 DATA_DIR = "/data"
@@ -17,34 +18,47 @@ def webhook():
         f.write(str(data) + "\n")
     return "Webhook received", 200
 
-from idea_summarizer import load_config, IdeaSummarizer
-config = load_config()
-summarizer = IdeaSummarizer(config)
+from idea_summarizer import process_idea, save_idea_to_obsidian
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
     idea_text = request.json.get("idea_text")
     if not idea_text:
         return {"error": "Missing idea_text"}, 400
-    idea = summarizer.process_input("direct_text", text=idea_text)
-    if idea:
-        return {"title": idea.title, "summary": idea.summary}, 200
-    else:
-        return {"error": "Failed to process the idea."}, 500
+    
+    try:
+        # Process the idea using our simplified function
+        idea = process_idea(idea_text)
+        
+        # Always save to Obsidian by default
+        obsidian_path = None
+        try:
+            obsidian_path = save_idea_to_obsidian(idea)
+        except Exception as e:
+            # Log the error but continue with the response
+            print(f"Warning: Failed to save to Obsidian: {str(e)}")
 
-@app.route("/voip", methods=["POST"])
-def voip():
-    data = request.get_json()
-    action = data.get("action")
-    number = data.get("number")
-    if action not in ["call", "text"] or not number:
-        return {"error": "Invalid parameters"}, 400
-    if action == "call":
-        result = "Calling " + number
-    else:
-        message = data.get("message", "")
-        result = "Texting " + number + " with message: " + message
-    return {"result": result}, 200
+        # Return a more comprehensive response
+        response = {
+            "id": idea.id,
+            "title": idea.title,
+            "summary": idea.summary,
+            "key_points": idea.key_points,
+            "category": idea.category,
+            "tech_stack": idea.tech_stack.to_dict(),
+            "design_philosophy": idea.design_philosophy.to_dict(),
+            "market_analysis": idea.market_analysis,
+            "risks": idea.risks
+        }
+        
+        # Add obsidian_path to response if available
+        if obsidian_path:
+            response["obsidian_path"] = obsidian_path
+            
+        return response, 200
+        
+    except Exception as e:
+        return {"error": f"Processing failed: {str(e)}"}, 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

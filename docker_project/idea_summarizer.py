@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-Enterprise Idea Summarization System
-------------------------------------
-A system to process text and audio inputs, summarize business/software ideas,
-and store them in Obsidian notes with a focus on extensibility.
+Idea Summarization System
+-------------------------
+A system to process text inputs, summarize business/software ideas,
+and store them in Obsidian notes.
 
 Using Langchain and LLM integration for intelligent analysis.
 """
 
 import os
 import json
-import time
-import logging
-import subprocess
 import uuid
-from abc import ABC, abstractmethod
+import logging
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
-from langchain.output_parsers import ResponseSchema, StructuredOutputParser  
-from langchain.chains import LLMChain
-
+from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
 # Load environment variables from .env
 load_dotenv()
@@ -33,18 +29,15 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(f"{datetime.now()} - summarizer.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger(f"{datetime.now()} - summarizer")
+logger = logging.getLogger("idea_summarizer")
 
 # ==================== DATA MODELS ====================
 
 @dataclass
 class IdeaMetadata:
-    source_type: str  # e.g. 'audio', 'text_file', 'direct_text', etc.
+    source_type: str  # e.g. 'text_file', 'direct_text', etc.
     source_name: str
     timestamp: str
     tags: List[str] = field(default_factory=list)
@@ -73,6 +66,9 @@ class TechStack:
                     md += f"- {item}\n"
                 md += "\n"
         return md
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 @dataclass
 class DesignPhilosophy:
@@ -94,6 +90,9 @@ class DesignPhilosophy:
                     md += f"- {item}\n"
                 md += "\n"
         return md
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 @dataclass
 class Idea:
@@ -140,130 +139,34 @@ class Idea:
         md += "\n## Raw Content\n```\n" + self.raw_content + "\n```\n"
         return md
 
-# ==================== INPUT SOURCES ====================
+# ==================== INPUT PROCESSING ====================
 
-class ContentSource(ABC):
-    @abstractmethod
-    def get_content(self) -> Dict[str, Any]:
-        pass
-
-class TextFileSource(ContentSource):
-    def __init__(self, file_path: str):
-        self.file_path = file_path
+class TextProcessor:
+    """Simple class to process text input"""
     
-    def get_content(self) -> Dict[str, Any]:
-        with open(self.file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return {
-            "content": content,
-            "metadata": {
-                "source_type": "text_file",
-                "source_name": os.path.basename(self.file_path),
-                "timestamp": datetime.now().isoformat()
-            }
-        }
-
-class AudioFileSource(ContentSource):
-    def __init__(self, file_path: str, whisper_path: str = os.environ.get("WHISPER_PATH", "./whisper.cpp")):
-        self.file_path = file_path
-        self.whisper_path = whisper_path
-    
-    def get_content(self) -> Dict[str, Any]:
-        if not os.path.exists(self.file_path):
-            raise FileNotFoundError(f"Audio file not found: {self.file_path}")
-        whisper_exe = os.path.join(self.whisper_path, "main")
-        if not os.path.exists(whisper_exe):
-            raise FileNotFoundError(f"whisper.cpp executable not found at {whisper_exe}")
-        model_path = os.path.join(self.whisper_path, "models/ggml-base.en.bin")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Whisper model not found at {model_path}")
-        output_file = f"temp_transcription_{int(time.time())}.txt"
-        cmd = [whisper_exe, "-m", model_path, "-f", self.file_path, "-otxt", "-of", output_file]
-        logger.info(f"Running transcription command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Transcription failed: {result.stderr}")
-        with open(output_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-        os.remove(output_file)
-        return {
-            "content": content,
-            "metadata": {
-                "source_type": "audio_file",
-                "source_name": os.path.basename(self.file_path),
-                "timestamp": datetime.now().isoformat()
-            }
-        }
-
-class EmailSource(ContentSource):
-    def __init__(self, email_path: str):
-        self.email_path = email_path
-    
-    def get_content(self) -> Dict[str, Any]:
-        with open(self.email_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return {
-            "content": content,
-            "metadata": {
-                "source_type": "email",
-                "source_name": os.path.basename(self.email_path),
-                "timestamp": datetime.now().isoformat()
-            }
-        }
-
-class TelegramSource(ContentSource):
-    def __init__(self, message_data: Dict[str, Any]):
-        self.message_data = message_data
-    
-    def get_content(self) -> Dict[str, Any]:
-        content = self.message_data.get("text", "")
-        sender = self.message_data.get("sender", "Unknown")
-        timestamp = self.message_data.get("timestamp", datetime.now().isoformat())
-        return {
-            "content": content,
-            "metadata": {
-                "source_type": "telegram",
-                "source_name": sender,
-                "timestamp": timestamp
-            }
-        }
-
-class DirectTextSource(ContentSource):
-    def __init__(self, text: str):
+    def __init__(self, text: str, source_type: str = "direct_text", source_name: str = "direct_input"):
         self.text = text
+        self.metadata = {
+            "source_type": source_type,
+            "source_name": source_name,
+            "timestamp": datetime.now().isoformat()
+        }
+    
     def get_content(self) -> Dict[str, Any]:
         return {
             "content": self.text,
-            "metadata": {
-                "source_type": "direct_text",
-                "source_name": "direct_input",
-                "timestamp": datetime.now().isoformat()
-            }
+            "metadata": self.metadata
         }
-
-def create_content_source(source_type: str, **kwargs) -> ContentSource:
-    if source_type == "text_file":
-        return TextFileSource(kwargs.get("file_path"))
-    elif source_type == "audio_file":
-        return AudioFileSource(kwargs.get("file_path"))
-    elif source_type == "email":
-        return EmailSource(kwargs.get("email_path"))
-    elif source_type == "telegram":
-        return TelegramSource(kwargs.get("message_data", {}))
-    elif source_type == "direct_text":
-        return DirectTextSource(kwargs.get("text"))
-    else:
-        raise ValueError(f"Unsupported source type: {source_type}")
 
 # ==================== LLM PROCESSING WITH LANGCHAIN ====================
 
 class LangchainProcessor:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self):
         try:
             self.llm = ChatOpenAI(
-                model_name=config.get("openai_model", os.environ.get("OPENAI_MODEL", "gpt-4")),
-                temperature=float(config.get("temperature", os.environ.get("TEMPERATURE", 0.7))),
-                openai_api_key=config.get("openai_api_key", os.environ.get("OPENAI_API_KEY", ""))
+                model_name=os.getenv("OPENAI_MODEL", "gpt-4-turbo"),
+                temperature=float(os.getenv("TEMPERATURE", "0.7")),
+                openai_api_key=os.getenv("OPENAI_API_KEY")
             )
             self.title_schema = ResponseSchema(
                 name="title",
@@ -319,27 +222,27 @@ class LangchainProcessor:
 Please analyze the following business or software idea and provide a comprehensive breakdown, strictly following the JSON schema provided below.
 
 JSON Schema:
-{
+{{
   "title": "string, concise title (max 60 chars)",
   "summary": "string, comprehensive summary (200-300 words)",
   "key_points": ["string", ...],  // Array of 5-7 key points
   "category": "string, one word category (e.g., software, business)",
   "tags": ["string", ...],         // JSON array of 5-10 tags
-  "tech_stack": {
+  "tech_stack": {{
       "frontend": ["string"],
       "backend": ["string"],
       "database": ["string"],
       "infrastructure": ["string"],
       "tools": ["string"]
-  },
-  "design_philosophy": {
+  }},
+  "design_philosophy": {{
       "principles": ["string"],
       "architecture": ["string"],
       "methodology": ["string"]
-  },
+  }},
   "market_analysis": "string, brief market analysis",
   "risks": ["string", ...]         // Array of potential risks
-}
+}}
 
 Ensure that your response is valid JSON and follows the schema exactly. Do not include any extraneous text outside of the JSON.
 
@@ -349,7 +252,13 @@ IDEA:
 {format_instructions}
 """
             )
-            self.chain = LLMChain(llm=self.llm, prompt=self.prompt_template)
+            # Create a chain that explicitly includes format_instructions
+            self.chain = (
+                {"idea_text": RunnablePassthrough(), "format_instructions": lambda _: self.format_instructions}
+                | self.prompt_template
+                | self.llm
+                | self.parser
+            )
             self.langchain_available = True
             logger.info("Langchain initialized successfully")
         except ImportError as e:
@@ -360,71 +269,19 @@ IDEA:
         if not self.langchain_available:
             return self._fallback_process(text)
         try:
-            result = self.chain.run(
-                idea_text=text,
-                format_instructions=self.format_instructions
-            )
-            parsed_result = self.parser.parse(result)
-            parsed_result = self._process_complex_fields(parsed_result)
-            return parsed_result
+            # Get structured output from LLM
+            result = self.chain.invoke({"idea_text": text})
+            
+            # Convert nested dicts to dataclass instances
+            if "tech_stack" in result:
+                result["tech_stack"] = TechStack(**result["tech_stack"])
+            if "design_philosophy" in result:
+                result["design_philosophy"] = DesignPhilosophy(**result["design_philosophy"])
+            
+            return result
         except Exception as e:
             logger.error(f"Error processing with Langchain: {e}")
             return self._fallback_process(text)
-
-    def _process_complex_fields(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        if "tech_stack" in result and isinstance(result["tech_stack"], str):
-            tech_stack = {"frontend": [], "backend": [], "database": [], "infrastructure": [], "tools": []}
-            sections = result["tech_stack"].split("\n")
-            current_section = None
-            for section in sections:
-                section = section.strip()
-                if not section:
-                    continue
-                lower_section = section.lower()
-                if "frontend" in lower_section:
-                    current_section = "frontend"
-                elif "backend" in lower_section:
-                    current_section = "backend"
-                elif "database" in lower_section:
-                    current_section = "database"
-                elif "infrastructure" in lower_section:
-                    current_section = "infrastructure"
-                elif "tools" in lower_section:
-                    current_section = "tools"
-                elif current_section and section.startswith("-"):
-                    tech_stack[current_section].append(section.lstrip("- ").strip())
-            result["tech_stack"] = tech_stack
-        if "design_philosophy" in result and isinstance(result["design_philosophy"], str):
-            design_philosophy = {"principles": [], "architecture": [], "methodology": []}
-            sections = result["design_philosophy"].split("\n")
-            current_section = None
-            for section in sections:
-                section = section.strip()
-                if not section:
-                    continue
-                lower_section = section.lower()
-                if "principles" in lower_section:
-                    current_section = "principles"
-                elif "architecture" in lower_section:
-                    current_section = "architecture"
-                elif "methodology" in lower_section:
-                    current_section = "methodology"
-                elif current_section and section.startswith("-"):
-                    design_philosophy[current_section].append(section.lstrip("- ").strip())
-            result["design_philosophy"] = design_philosophy
-        if "key_points" in result and isinstance(result["key_points"], str):
-            key_points = [point.strip().lstrip("-").strip() for point in result["key_points"].split("\n") if point.strip() and not point.strip().lower().startswith(("key points", "features"))]
-            result["key_points"] = key_points
-        if "risks" in result and isinstance(result["risks"], str):
-            risks = [risk.strip().lstrip("-").strip() for risk in result["risks"].split("\n") if risk.strip() and not risk.strip().lower().startswith(("risks", "challenges"))]
-            result["risks"] = risks
-        if "tags" in result and isinstance(result["tags"], str):
-            if "," in result["tags"]:
-                tags = [tag.strip() for tag in result["tags"].split(",") if tag.strip()]
-            else:
-                tags = [tag.strip().lstrip("-").strip() for tag in result["tags"].split("\n") if tag.strip() and not tag.strip().lower().startswith("tags")]
-            result["tags"] = tags
-        return result
 
     def _fallback_process(self, text: str) -> Dict[str, Any]:
         lines = [line.strip() for line in text.split('\n') if line.strip()]
@@ -445,178 +302,84 @@ IDEA:
             "key_points": key_points[:7],
             "category": "unknown",
             "tags": [],
-            "tech_stack": {
-                "frontend": [],
-                "backend": [],
-                "database": [],
-                "infrastructure": [],
-                "tools": []
-            },
-            "design_philosophy": {
-                "principles": [],
-                "architecture": [],
-                "methodology": []
-            },
+            "tech_stack": TechStack(),
+            "design_philosophy": DesignPhilosophy(),
             "market_analysis": "",
             "risks": []
         }
 
-# ==================== STORAGE SYSTEMS ====================
+# ==================== OBSIDIAN INTEGRATION ====================
 
-class IdeaStorage(ABC):
-    @abstractmethod
-    def save_idea(self, idea: Idea) -> bool:
-        pass
+class ObsidianExporter:
+    def __init__(self, vault_path: str = None):
+        # Use OBS_VAULT_PATH from .env if provided, otherwise fall back to OBSIDIAN_VAULT or default
+        self.vault_path = vault_path or os.getenv("OBS_VAULT_PATH") or os.getenv("OBSIDIAN_VAULT", "/obsidian/vault")
+        
+        # Convert relative path to absolute if needed
+        if not os.path.isabs(self.vault_path):
+            # Get the current working directory
+            cwd = os.getcwd()
+            self.vault_path = os.path.abspath(os.path.join(cwd, self.vault_path))
+            logger.info(f"Converting relative path to absolute: {self.vault_path}")
+        
+        self.ideas_folder = os.path.join(self.vault_path, "Ideas")
+        
+        # Ensure the Ideas folder exists
+        os.makedirs(self.ideas_folder, exist_ok=True)
+        logger.info(f"Obsidian vault path: {self.vault_path}")
+        logger.info(f"Ideas folder: {self.ideas_folder}")
     
-    @abstractmethod
-    def get_idea(self, idea_id: str) -> Optional[Idea]:
-        pass
+    def export_idea(self, idea: Idea) -> str:
+        """Export an idea to the Obsidian vault as a markdown file"""
+        # Create a safe filename
+        safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in idea.title)
+        safe_title = safe_title.replace(" ", "_")
+        filename = f"{safe_title}_{idea.id[:8]}.md"
+        file_path = os.path.join(self.ideas_folder, filename)
+        
+        # Write the markdown content
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(idea.to_markdown())
+        
+        logger.info(f"Exported idea to {file_path}")
+        return file_path
 
-class ObsidianVaultStorage(IdeaStorage):
-    def __init__(self, vault_path: str):
-        self.vault_path = Path(vault_path)
-        self.ideas_path = self.vault_path / "Ideas"
-        self.ideas_path.mkdir(parents=True, exist_ok=True)
-        self.index_path = self.ideas_path / "IdeaIndex.md"
-        if not self.index_path.exists():
-            with open(self.index_path, 'w', encoding='utf-8') as f:
-                f.write("# Idea Index\n\n")
-                f.write("This file serves as an index of all captured ideas.\n\n")
-                f.write("## Recent Ideas\n\n")
+# ==================== MAIN FUNCTIONALITY ====================
+
+def process_idea(text: str, source_type: str = "direct_text", source_name: str = "direct_input") -> Idea:
+    """Process an idea text and return a structured Idea object"""
+    # Process the input
+    processor = TextProcessor(text, source_type, source_name)
+    content_data = processor.get_content()
     
-    def save_idea(self, idea: Idea) -> bool:
-        try:
-            safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in idea.title)
-            safe_title = safe_title.replace(" ", "_")
-            filename = f"{idea.id}_{safe_title}.md"
-            file_path = self.ideas_path / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(idea.to_markdown())
-            with open(self.index_path, 'r', encoding='utf-8') as f:
-                index_content = f.read()
-            section_marker = "## Recent Ideas\n\n"
-            insert_pos = index_content.find(section_marker) + len(section_marker)
-            tags_str = ""
-            if idea.metadata.tags:
-                tags_str = f" #{''.join([f' #{tag}' for tag in idea.metadata.tags])}"
-            new_entry = f"- [[{filename.replace('.md', '')}|{idea.title}]] - {idea.metadata.timestamp[:10]} - {idea.category}{tags_str}\n"
-            updated_content = index_content[:insert_pos] + new_entry + index_content[insert_pos:]
-            with open(self.index_path, 'w', encoding='utf-8') as f:
-                f.write(updated_content)
-            logger.info(f"Saved idea to {file_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving idea to Obsidian vault: {e}")
-            return False
+    # Process with Langchain
+    langchain_processor = LangchainProcessor()
+    processed = langchain_processor.process(content_data["content"])
     
-    def get_idea(self, idea_id: str) -> Optional[Idea]:
-        matching_files = list(self.ideas_path.glob(f"{idea_id}_*.md"))
-        if not matching_files:
-            logger.warning(f"No idea found with ID {idea_id}")
-            return None
-        file_path = matching_files[0]
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            title_line = content.split('\n')[0]
-            title = title_line.replace("# ", "") if title_line.startswith("# ") else "Untitled"
-            summary_start = content.find("## Summary\n") + len("## Summary\n")
-            summary_end = content.find("\n\n", summary_start)
-            summary = content[summary_start:summary_end].strip()
-            return Idea(
-                id=idea_id,
-                title=title,
-                summary=summary,
-                key_points=[],
-                category="unknown",
-                raw_content="",
-                metadata=IdeaMetadata(
-                    source_type="unknown",
-                    source_name="unknown",
-                    timestamp=datetime.now().isoformat()
-                )
-            )
-        except Exception as e:
-            logger.error(f"Error retrieving idea {idea_id}: {e}")
-            return None
-
-# ==================== MAIN APPLICATION CLASS ====================
-
-class IdeaSummarizer:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.processor = LangchainProcessor(config)
-        self.storage = ObsidianVaultStorage(config.get("obsidian_vault_path", "./ObsidianVault"))
+    # Create metadata
+    metadata = IdeaMetadata(
+        source_type=content_data["metadata"]["source_type"],
+        source_name=content_data["metadata"]["source_name"],
+        timestamp=content_data["metadata"]["timestamp"],
+        tags=processed.get("tags", [])
+    )
     
-    def process_input(self, source_type: str, **source_kwargs) -> Optional[Idea]:
-        try:
-            source = create_content_source(source_type, **source_kwargs)
-            content_data = source.get_content()
-            raw_content = content_data["content"]
-            metadata = IdeaMetadata(**content_data["metadata"])
-            logger.info("Processing content with Langchain")
-            processed_data = self.processor.process(raw_content)
-            if "tags" in processed_data and processed_data["tags"]:
-                metadata.tags = processed_data["tags"]
-            idea_id = f"idea_{str(uuid.uuid4())[:8]}"
-            tech_stack = None
-            if "tech_stack" in processed_data and processed_data["tech_stack"]:
-                tech_stack_data = processed_data["tech_stack"]
-                tech_stack = TechStack(
-                    frontend=tech_stack_data.get("frontend", []),
-                    backend=tech_stack_data.get("backend", []),
-                    database=tech_stack_data.get("database", []),
-                    infrastructure=tech_stack_data.get("infrastructure", []),
-                    tools=tech_stack_data.get("tools", [])
-                )
-            design_philosophy = None
-            if "design_philosophy" in processed_data and processed_data["design_philosophy"]:
-                design_data = processed_data["design_philosophy"]
-                design_philosophy = DesignPhilosophy(
-                    principles=design_data.get("principles", []),
-                    architecture=design_data.get("architecture", []),
-                    methodology=design_data.get("methodology", [])
-                )
-            idea = Idea(
-                id=idea_id,
-                title=processed_data["title"],
-                summary=processed_data["summary"],
-                key_points=processed_data["key_points"],
-                category=processed_data["category"],
-                raw_content=raw_content,
-                metadata=metadata,
-                tech_stack=tech_stack,
-                design_philosophy=design_philosophy,
-                market_analysis=processed_data.get("market_analysis"),
-                risks=processed_data.get("risks", [])
-            )
-            if self.storage.save_idea(idea):
-                return idea
-            return None
-        except Exception as e:
-            logger.error(f"Error processing input: {e}")
-            return None
+    # Create and return the Idea object
+    return Idea(
+        id=str(uuid.uuid4()),
+        title=processed["title"],
+        summary=processed["summary"],
+        key_points=processed["key_points"],
+        category=processed["category"],
+        raw_content=content_data["content"],
+        metadata=metadata,
+        tech_stack=processed["tech_stack"],
+        design_philosophy=processed["design_philosophy"],
+        market_analysis=processed["market_analysis"],
+        risks=processed["risks"]
+    )
 
-def load_config() -> Dict[str, Any]:
-    default_config = {
-        "storage_type": os.environ.get("STORAGE_TYPE", "obsidian"),
-        "obsidian_vault_path": os.environ.get("OBS_VAULT_PATH", "./ObsidianVault"),
-        "whisper_path": os.environ.get("WHISPER_PATH", "./whisper.cpp"),
-        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
-        "openai_model": os.environ.get("OPENAI_MODEL", "gpt-4"),
-        "temperature": float(os.environ.get("TEMPERATURE", 0.7))
-    }
-    return default_config
-
-if __name__ == "__main__":
-    config = load_config()
-    summarizer = IdeaSummarizer(config)
-    # For demonstration purposes, process a direct text input
-    example_text = "This is a sample business idea for a next generation idea summarization system that uses Langchain and local transcription with whisper.cpp to generate summaries and store them in an Obsidian vault. Additionally, the system will support VOIP functionalities using pjsua2 for calling or texting a specified number."
-    idea = summarizer.process_input("direct_text", text=example_text)
-    if idea:
-        print("Idea processed and saved successfully!")
-        print("Title:", idea.title)
-        print("Summary:", idea.summary)
-    else:
-        print("Failed to process the idea.")
+def save_idea_to_obsidian(idea: Idea) -> str:
+    """Save an idea to the Obsidian vault"""
+    exporter = ObsidianExporter()
+    return exporter.export_idea(idea)

@@ -9,3 +9,4 @@ numpy
 pandas
 matplotlib
 langchain_openai
+requests

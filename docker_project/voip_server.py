@@ -1,194 +1,271 @@
 #!/usr/bin/env python3
-import os, sys, time, threading, queue
-from time import sleep
+"""
+VOIP Library Implementation using pjsua2
+
+Features:
+- Event-driven architecture
+- Concurrent call handling
+- DTMF menu navigation
+- Recording/playback controls
+- Docker compatible
+- Phone number formatting support
+"""
+
+import os
+import re
+import sys
+import time
+import threading
+import logging
+from typing import Dict, Callable, Optional
 from dotenv import load_dotenv
+from datetime import datetime
 from pjsua2 import *
 
-sys.path.insert(0, '/opt/pjproject/pjsip-apps/src/python')
-sys.path.insert(0, '/usr/local/lib/python3.8/dist-packages')
-print("Current sys.path:", sys.path)
 load_dotenv()
 
-"""
-VOIP Server Implementation using pjsua2 with .env configuration.
-Handles both incoming text messages and voice calls.
-- Incoming texts are directly forwarded to idea_summarizer.py.
-- For voice calls:
-    • A greeting message is played.
-    • The call is recorded until it ends.
-    • The recorded audio is converted to a 16kHz WAV file.
-    • whisper.cpp (assumed to be available as an executable) transcribes the audio.
-    • The transcription text is forwarded to idea_summarizer.py.
-"""
+class CallSession:
+    """Manages state and media for a single call"""
+    def __init__(self, call, config: dict):
+        self.call = call
+        self.config = config
+        self.recorder = None
+        self.player = None
+        self.audio_med = None
+        self.dtmf_buffer = []
+        self.recording_file = None
+        self._init_recording()
 
-recording_queue = queue.Queue()
+    def _init_recording(self):
+        if self.config.get('record', True):
+            self.recording_file = f"recording_{int(time.time()*1000)}.wav"
+            self.recorder = AudioMediaRecorder()
+            self.recorder.createRecorder(self.recording_file)
 
-def generate_unique_filename(prefix="recording", ext="wav"):
-    return f"{prefix}_{int(time.time() * 1000)}.{ext}"
+    def play_audio(self, file_path: str):
+        """Play audio file to the call"""
+        if self.player:
+            self.player.stopTransmit(self.audio_med)
+        self.player = AudioMediaPlayer()
+        self.player.createPlayer(file_path)
+        self.player.startTransmit(self.audio_med)
 
-def transcription_worker():
-    while True:
-        recording_file = recording_queue.get()
-        if recording_file is None:
-            break
-        try:
-            print(f"[Transcription] Transcribing file: {recording_file}")
-            cmd_whisper = ["whisper.exe", recording_file]
-            result = subprocess.run(cmd_whisper, capture_output=True, text=True, check=True)
-            transcription = result.stdout.strip()
-            print(f"[Transcription] Result for {recording_file}: {len(transcription.split(' '))} words")
-            #Idea Summarize
-        except Exception as e:
-            print(f"[Transcription] Error processing {recording_file}: {e}")
-        finally:
-            recording_queue.task_done()
+    def start_recording(self):
+        """Start recording call audio"""
+        if self.recorder and self.audio_med:
+            self.audio_med.startTransmit(self.recorder)
 
-# Define the Account callback to handle incoming calls and messages
-class MyAccount(Account):
+    def stop_recording(self):
+        """Stop and save recording"""
+        if self.recorder and self.audio_med:
+            self.audio_med.stopTransmit(self.recorder)
+            return self.recording_file
+        return None
+
+    def handle_dtmf(self, digit: str):
+        """Process DTMF digit and navigate menu"""
+        self.dtmf_buffer.append(digit)
+        menu = self.config.get('dtmf_menu')
+        if menu:
+            current = menu
+            for d in self.dtmf_buffer:
+                current = current.get(d, {})
+                if 'action' in current:
+                    current['action'](self)
+                    self.dtmf_buffer = []
+
+class VoIPLibrary(Account):
+    """Main VOIP library class with phone number support"""
     def __init__(self):
         super().__init__()
-        self.calls = []
+        self.ep = Endpoint()
+        self.active_calls: Dict[str, CallSession] = {}
+        self.event_handlers = {
+            'incoming_call': None,
+            'incoming_message': None,
+            'call_connected': None,
+            'call_ended': None,
+            'dtmf_received': None
+        }
+        self._init_endpoint()
 
-    def onRegState(self, prm):
-        print(f"Registration state: {prm.code} ({prm.reason})")
+    def _init_endpoint(self):
+        self.ep.libCreate()
+        ep_cfg = EpConfig()
+        ep_cfg.logConfig.level = 4
+        ep_cfg.logConfig.consoleLevel = 0
+        ep_cfg.logConfig.filename = f"{datetime.now()}-pjsua2-server.log"
+        self.ep.libInit(ep_cfg)
+        self.ep.audDevManager().setNullDev()
+
+    def _format_phone_number(self, number: str) -> str:
+        """Convert phone number to SIP URI using .env config"""
+        # Clean the number
+        cleaned = re.sub(r'(?!^\+)\D', '', number)
+        
+        # Get domain from SIP_REGISTRAR
+        registrar = os.getenv("SIP_REGISTRAR", "sip:provider.example.com")
+        domain = registrar.split("@")[-1].split(":")[0]
+        
+        return f"sip:{cleaned}@{domain}"
+
+    def place_call(self, number: str, config: dict) -> CallSession:
+        """Initiate outgoing call to phone number or SIP URI"""
+        if not number.startswith("sip:"):
+            number = self._format_phone_number(number)
+            
+        call = Call(self, CallOpParam())
+        call_prm = CallOpParam(True)
+        try:
+            call.makeCall(number, call_prm)
+            session = CallSession(call, config)
+            self.active_calls[call.getId()] = session
+            return session
+        except Exception as e:
+            logging.error(f"Call failed: {str(e)}")
+            raise
+
+    def send_message(self, number: str, text: str):
+        """Send text message to phone number or SIP URI"""
+        if not number.startswith("sip:"):
+            number = self._format_phone_number(number)
+            
+        send_prm = SendInstantMessageParam()
+        self.sendInstantMessage(number, text, send_prm)
+
+    def start_service(self):
+        """Start VOIP service with .env config"""
+        # Configure transport
+        trans_cfg = TransportConfig()
+        trans_cfg.port = int(os.getenv("SIP_PORT", 5060))
+        self.ep.transportCreate(PJSIP_TRANSPORT_UDP, trans_cfg)
+        
+        # Start library
+        self.ep.libStart()
+        
+        # Register account
+        acc_cfg = AccountConfig()
+        acc_cfg.idUri = os.getenv("SIP_ID_URI")
+        acc_cfg.regConfig.registrarUri = os.getenv("SIP_REGISTRAR")
+        auth = AuthCredInfo(
+            "digest",
+            os.getenv("SIP_REALM", "*"),
+            os.getenv("SIP_USERNAME"),
+            0,
+            os.getenv("SIP_PASSWORD")
+        )
+        acc_cfg.sipConfig.authCreds.append(auth)
+        self.create(acc_cfg)
+        
+        # Start event loop
+        self.running = True
+        self.event_thread = threading.Thread(target=self._event_loop, daemon=True)
+        self.event_thread.start()
+
+    def _event_loop(self):
+        """Handle library events"""
+        # Register this thread with PJSUA
+        try:
+            self.ep.libRegisterThread("event_thread")
+            while self.running:
+                self.ep.libHandleEvents(10)
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            self.stop_service()
+        except Exception as e:
+            logging.error(f"Event loop failed: {str(e)}")
+            self.stop_service()
+
+    def stop_service(self):
+        """Shutdown VOIP service"""
+        self.running = False
+        for call_id, session in list(self.active_calls.items()):
+            try:
+                session.call.hangup(CallOpParam())
+            except Exception as e:
+                logging.error(f"Error hanging up call {call_id}: {str(e)}")
+
+        try:
+            self.setRegistration(False)
+        except Exception as e:
+            logging.error(f"Error unregistering account: {str(e)}")
+
+        time.sleep(1)
+
+        self.ep.libDestroy()
+        if self.event_thread.is_alive():
+            self.event_thread.join(timeout=1)
 
     def onIncomingCall(self, prm):
-        print("Incoming call...")
-        call = MyCall(self, prm.callId)
-        self.calls.append(call)
-        call_prm = CallOpParam()
-        call_prm.statusCode = 180  # 180 Ringing
-        call.answer(call_prm)
-        call_prm.statusCode = 200
-        call.answer(call_prm)
-        print("Incoming call answered.")
+        """Handle incoming call event"""
+        call = Call(self, prm.callId)
+        session = CallSession(call, {})
+        self.active_calls[call.getId()] = session
+        
+        if self.event_handlers['incoming_call']:
+            self.event_handlers['incoming_call'](session)
 
     def onInstantMessage(self, prm):
-        # Handle incoming text messages
-        text = prm.content
-        print("Received text message:", text)
-        forward_text_to_idea_summarizer(text)
+        """Handle incoming text message"""
+        if self.event_handlers['incoming_message']:
+            self.event_handlers['incoming_message']({
+                'from': prm.fromUri,
+                'content': prm.msgBody
+            })
 
-# Define the Call callback to manage call media and state
-class MyCall(Call):
-    def __init__(self, acc, call_id=PJSUA_INVALID_ID):
-        super().__init__(acc, call_id)
-        self.record_file = generate_unique_filename()
-        self.player = None
-        self.recorder = None
-        self.audio_med = None
+    def onRegState(self, prm):
+        """Handle registration state changes"""
+        logging.info(f"Registration status: {prm.code} {prm.reason}")
+        if prm.code == 200:
+            print("Connected: Successfully registered with the SIP server.")
+        else:
+            print(f"Registration update: {prm.code} - {prm.reason}")
 
-    def onCallState(self, prm):
-        ci = self.getInfo()
-        print(f"[Call] State: {ci.stateText}")
-        print(f"[Call] Incoming call from: {ci.remoteUri}")
-        if ci.state == PJSIP_INV_STATE_DISCONNECTED:
-            if self.recorder:
-                time.sleep(1)
-                print(f"[Call] Call disconnected. Pushing {self.record_file} to transcription queue.")
-                recording_queue.put(self.record_file)
-            self.cleanup()
+    def onIncomingSubscribe(self, prm):
+        """Handle presence subscription requests"""
+        return 202  # Automatically accept subscriptions
 
-    def onCallMediaState(self, prm):
-        ci = self.getInfo()
-        for mi in ci.media:
-            if mi.type == PJMEDIA_TYPE_AUDIO and \
-               (mi.status == PJSUA_CALL_MEDIA_ACTIVE or 
-                mi.status == PJSUA_CALL_MEDIA_REMOTE_HOLD):
-                try:
-                    self.audio_med = self.getAudioMedia(mi.index)
-                    self.start_audio(self.audio_med)
-                except Exception as e:
-                    print("[Call] Error getting audio media:", e)
+    class Call(Call):
+        def onCallState(self, prm):
+            """Handle call state changes"""
+            session = self.account.active_calls.get(self.getId())
+            if prm.e.body.type == PJSIP_EVENT_RX_MSG:
+                if prm.e.body.rxMsg.method == "BYE" and session:
+                    if self.account.event_handlers['call_ended']:
+                        self.account.event_handlers['call_ended'](session)
+                    del self.account.active_calls[self.getId()]
+            elif self.getInfo().state == PJSIP_INV_STATE_CONFIRMED and session:
+                if self.account.event_handlers['call_connected']:
+                    self.account.event_handlers['call_connected'](session)
 
-    def start_audio(self, audio_med):
-        try:
-            greeting_file = os.getenv("GREETING_WAV", "greeting.wav")
-            if os.path.exists(greeting_file):
-                self.player = AudioMediaPlayer()
-                self.player.createPlayer(greeting_file)
-                self.player.startTransmit(audio_med)
-                print("[Call] Playing greeting audio.")
-            else:
-                print("[Call] Greeting file not found, skipping playback.")
-            self.recorder = AudioMediaRecorder()
-            self.recorder.createRecorder(self.record_file)
-            audio_med.startTransmit(self.recorder)
-            print(f"[Call] Recording call audio to {self.record_file}.")
-        except Exception as e:
-            print("[Call] Error in start_audio:", e)
-
-    def cleanup(self):
-        try:
-            if self.audio_med:
-                if self.player:
-                    self.audio_med.stopTransmit(self.player)
-                    self.player = None
-                if self.recorder:
-                    self.audio_med.stopTransmit(self.recorder)
-                    self.recorder = None
-            # Ensure the call is properly hung up.
-            self.hangup(CallOpParam())
-        except Exception as e:
-            print("[Call] Error during cleanup:", e)
-
-def place_call(account, dest_uri):
-    call = MyCall(account)
-    call_prm = CallOpParam(True)
-    try:
-        call.makeCall(dest_uri, call_prm)
-        print("[Outgoing] Placing call to {dest_uri}.")
-    except Exception as e:
-        print("[Outgoing] Error placing call:", e)
-
-def forward_text_to_idea_summarizer(text):
-    """
-    Forwards the given text to idea_summarizer.py.
-    The idea_summarizer.py script is expected to read the text argument and process it.
-    """
-    cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "idea_summarizer.py"), text]
-    #subprocess.run(cmd, check=True)
-    print("Text forwarded to idea_summarizer.py.")
+        def onCallDtmfDigit(self, prm):
+            """Handle DTMF digit detection"""
+            session = self.account.active_calls.get(self.getId())
+            if session and self.account.event_handlers['dtmf_received']:
+                session.handle_dtmf(prm.digit)
+                self.account.event_handlers['dtmf_received'](prm.digit)
 
 def main():
-    ep = Endpoint()
-    ep.libCreate()
-    ep_cfg = EpConfig()
-    ep_cfg.logConfig.level = 4
-    ep_cfg.logConfig.consoleLevel = 4
-    ep.libInit(ep_cfg)
-
-    ep.audDevManager().setNullDev()
-
-    trans_cfg = TransportConfig()
-    trans_cfg.port = int(os.getenv("SIP_PORT", "5060"))
-    ep.transportCreate(PJSIP_TRANSPORT_UDP, trans_cfg)
-    ep.libStart()
-    print("pjsua2 library started.")
-
-    acc_cfg = AccountConfig()
-    acc_cfg.idUri = os.getenv("SIP_ID_URI")
-    acc_cfg.regConfig.registrarUri = os.getenv("SIP_REGISTRAR")
-    user = os.getenv("SIP_USERNAME")
-    password = os.getenv("SIP_PASSWORD")
-    auth_cred = AuthCredInfo("digest", "*", user, 0, password)
-    acc_cfg.sipConfig.authCreds.append(auth_cred)
-
-    my_acc = MyAccount()
-    my_acc.create(acc_cfg)
-    print("SIP account created and registered.")
-
-    print("VOIP server is running. Press Ctrl+C to exit.")
-    shutdown_event = threading.Event()
+    """Example usage preserving original functionality"""
+    lib = VoIPLibrary()
+    
+    # Setup event handlers
+    lib.event_handlers['incoming_call'] = lambda session: (
+        session.play_audio(os.getenv("GREETING_WAV", "greeting.wav")),
+        session.start_recording()
+    )
+    
+    lib.event_handlers['call_ended'] = lambda session: (
+        print(f"Call ended, recording saved to {session.recording_file}")
+    )
+    
+    lib.start_service()
+    print("VOIP service running. Press Ctrl+C to exit.")
     try:
-        while not shutdown_event.is_set():
-            ep.libHandleEvents(50)
-            shutdown_event.wait(0.05)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("KeyboardIntrrupt received, shutting down VOIP server...")
-    finally:
-        ep.libDestroy()
-        print("pjsua2 library destroyed.")
+        lib.stop_service()
 
 if __name__ == '__main__':
     main()
